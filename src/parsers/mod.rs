@@ -27,6 +27,7 @@ pub fn get_file_sanitization_strategy(path: &Path) -> Option<fn(String) -> Strin
         | "cloning.log"
         | "crafting.html"
         | "deaths.html"
+        | "demo.log"
         | "dynamic.json"
         | "dynamic.log.json"
         | "dynamic.log"

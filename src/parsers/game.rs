@@ -66,6 +66,10 @@ pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
             Some("Login:") => {
                 let mut words_vec = words.collect::<Vec<_>>();
 
+                if words_vec.len() < 4 {
+                    return censor!("malformed access login").into();
+                }
+
                 let ip_cid_index = words_vec.len() - 4;
                 words_vec[ip_cid_index] = censor!("ip/cid");
 
@@ -75,9 +79,18 @@ pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
                 ))
             }
 
-            Some("Failed") => censor!("invalid connection data").into(),
+            // Logout lines carry only a ckey, safe to keep verbatim.
+            Some("Logout:") => Cow::Borrowed(line),
 
-            _ => Cow::Borrowed(line),
+            // Anything else under ACCESS gets censored. Variants like
+            //   "Failed Login: ckey CID IP - reason"
+            //   "Forced disconnect: ckey CID IP - CID randomizer check"
+            //   "Notice: ckey has the same IP (X) / ID (Y) as other_ckey"
+            //   "AFK: ckey"
+            // either leak IP and CID in non-trivial positions or are noisy
+            // enough that default-censoring unknown subcategories is the
+            // safer choice for codebases that diverge from upstream tg.
+            _ => censor!("access detail").into(),
         },
 
         "ADMIN" => {
@@ -121,4 +134,76 @@ pub fn process_game_log(contents: String) -> String {
         .lines()
         .map(parse_line)
         .fold(String::new(), |a, b| a + &b + "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The IP regex runs at the file-level filter_ips() pass before parse_line()
+    // sees any line, so for these per-line tests we feed already-IP-filtered
+    // input (the IP literal substituted with the global "-censored-" token).
+
+    #[test]
+    fn access_login_strips_ip_cid_token() {
+        // Real format from client_procs.dm:229
+        // [ts] ACCESS: Login: ckey from <ip>-<cid> || BYOND v<v>
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Login: SomeUser from -censored--2548808841 || BYOND v516.1681";
+        let out = parse_line(line);
+        assert!(!out.contains("2548808841"), "CID survived: {out}");
+        assert!(out.contains("ip/cid"), "expected ip/cid censor token: {out}");
+        assert!(out.contains("SomeUser"), "ckey should remain: {out}");
+    }
+
+    #[test]
+    fn access_logout_kept_verbatim() {
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Logout: SomeUser";
+        let out = parse_line(line);
+        assert_eq!(out, line);
+    }
+
+    #[test]
+    fn access_failed_login_censored() {
+        // [ts] ACCESS: Failed Login: key CID IP - reason
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Failed Login: someone 1234567890 -censored- - blacklisted byond version";
+        let out = parse_line(line);
+        assert!(!out.contains("1234567890"), "CID survived in Failed Login: {out}");
+        assert!(out.contains("censored"), "expected censor token: {out}");
+    }
+
+    #[test]
+    fn access_forced_disconnect_censored() {
+        // [ts] ACCESS: Forced disconnect: ckey CID IP - CID randomizer check
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Forced disconnect: foo 1234567890 -censored- - CID randomizer check";
+        let out = parse_line(line);
+        assert!(!out.contains("1234567890"), "CID survived in Forced disconnect: {out}");
+        assert!(out.contains("censored"), "expected censor token: {out}");
+    }
+
+    #[test]
+    fn access_notice_same_ip_id_censored() {
+        // [ts] ACCESS: Notice: ckey has the same IP (X) / ID (Y) as other_ckey
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Notice: foo has the same ID (1234567890) as bar";
+        let out = parse_line(line);
+        assert!(!out.contains("1234567890"), "CID survived in Notice: {out}");
+        assert!(out.contains("censored"), "expected censor token: {out}");
+    }
+
+    #[test]
+    fn access_afk_censored() {
+        // server_maint.dm:66
+        let line = "[2026-04-30 16:20:42.301] ACCESS: AFK: someuser";
+        let out = parse_line(line);
+        // AFK lines aren't strictly sensitive but default-censor for unknown
+        // ACCESS subcategories is the contract.
+        assert!(out.contains("censored"), "expected censor token: {out}");
+    }
+
+    #[test]
+    fn adminprivate_censored() {
+        let line = "[2026-04-30 16:20:42.301] ADMINPRIVATE: ASAY: SomeAdmin/(real) ban deliberation";
+        let out = parse_line(line);
+        assert!(out.contains("private logtype"));
+        assert!(!out.contains("real"));
+    }
 }
