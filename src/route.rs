@@ -336,10 +336,68 @@ fn html_escape(input: &str) -> String {
     out
 }
 
+/// Pick a CSS class name based on the log category in this line.
+/// Lines look like `[2026-04-30 16:20:42.301] CATEGORY: rest of line`.
+/// Categories may be prefixed with `GAME-`. Lines that don't match the
+/// shape (e.g. `Starting up round ID 2.`, parser-generated `-censored(...)-`,
+/// continuation lines) get a default or censored class.
+fn line_class(line: &str) -> &'static str {
+    if line.starts_with("-censored(") {
+        return "log-censored";
+    }
+    let Some(rest) = line.strip_prefix('[') else {
+        return "log-default";
+    };
+    let Some((_, after_bracket)) = rest.split_once(']') else {
+        return "log-default";
+    };
+    let after = after_bracket.trim_start();
+    let Some((category_with_colon, _)) = after.split_once(' ') else {
+        return "log-default";
+    };
+    let Some(category) = category_with_colon.strip_suffix(':') else {
+        return "log-default";
+    };
+    // Strip the optional GAME- prefix the parser leaves alone (e.g. GAME-SAY).
+    match category.trim_start_matches("GAME-") {
+        "ATTACK" | "VICTIM" => "log-attack",
+        "SAY" | "WHISPER" | "RADIO" => "log-say",
+        "EMOTE" | "RADIO_EMOTE" | "SPEECH_INDICATORS" => "log-emote",
+        "DSAY" | "DEAD" => "log-dead",
+        "OOC" => "log-ooc",
+        "ADMIN" | "ASAY" => "log-admin",
+        "ADMINPRIVATE" => "log-adminprivate",
+        "ACCESS" => "log-access",
+        "PRAY" | "VOTE" | "GAME" => "log-event",
+        "PDA" | "CHAT" | "COMMENT" | "TELECOMMS" => "log-chat",
+        "MECHA" | "SHUTTLE" | "TRANSPORT" => "log-mechanism",
+        "ECON" | "ECONOMY" | "OWNERSHIP" => "log-econ",
+        "TOPIC" | "SQL" => "log-system",
+        _ => "log-default",
+    }
+}
+
+fn colorize_line(line: &str) -> String {
+    let class = line_class(line);
+    if class == "log-default" {
+        // No wrapping needed for the default class; saves bytes on long files.
+        html_escape(line)
+    } else {
+        format!("<span class=\"{class}\">{}</span>", html_escape(line))
+    }
+}
+
 fn viewer_page(relative_path: &std::path::Path, scrubbed_content: &str) -> String {
     let title = relative_path.display().to_string();
     let breadcrumbs = link_segments(relative_path);
-    let body = html_escape(scrubbed_content);
+    // Per-line colourisation by log category. Each line is HTML-escaped and
+    // wrapped in a span with a category-specific class so the stylesheet can
+    // tint ATTACK red, SAY green, ADMIN blue, etc.
+    let body: String = scrubbed_content
+        .lines()
+        .map(colorize_line)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "<!DOCTYPE html>
@@ -391,6 +449,22 @@ pre {{
     overflow-x: auto;
     background: light-dark(#fff, #1c1d1f);
 }}
+/* Per-line colour coding by log category. Tuned so each class is */
+/* readable against both the light and dark page background.      */
+.log-attack        {{ color: light-dark(#c0392b, #ff6b5a); }}
+.log-say           {{ color: light-dark(#27867d, #5fc6b8); }}
+.log-emote         {{ color: light-dark(#27867d, #5fc6b8); font-style: italic; }}
+.log-dead          {{ color: light-dark(#7d3c98, #c39ce6); font-style: italic; }}
+.log-ooc           {{ color: light-dark(#2874a6, #67aee6); }}
+.log-admin         {{ color: light-dark(#1e72c0, #6cb1ff); font-weight: 600; }}
+.log-adminprivate  {{ color: light-dark(#888, #777); font-style: italic; }}
+.log-access        {{ color: light-dark(#7f8c8d, #98a4a5); }}
+.log-event         {{ color: light-dark(#b9770e, #ffb84a); }}
+.log-chat          {{ color: light-dark(#16a085, #5dd6be); }}
+.log-mechanism     {{ color: light-dark(#7e5109, #d4a44a); }}
+.log-econ          {{ color: light-dark(#2e6b35, #6eba79); }}
+.log-system        {{ color: light-dark(#888, #888); }}
+.log-censored      {{ color: light-dark(#aaa, #666); font-style: italic; }}
 </style>
 </head>
 <body>
@@ -471,12 +545,68 @@ mod tests {
     #[test]
     fn viewer_page_contains_path_and_escaped_body() {
         let path = std::path::Path::new("2026/04/30/round-2/game.log");
-        let content = "[ts] GAME: <not really a tag>";
+        let content = "[2026-04-30 16:20:42.301] GAME: <not really a tag>";
         let html = viewer_page(path, content);
         assert!(html.contains("<title>2026/04/30/round-2/game.log</title>"));
         assert!(html.contains("&lt;not really a tag&gt;"));
         assert!(html.contains("?raw=1"));
         // breadcrumb segment for round-2
         assert!(html.contains(">round-2</a>"));
+    }
+
+    #[test]
+    fn line_class_matches_categories() {
+        let cases = &[
+            ("[2026-04-30 16:20:42.301] ATTACK: ckey hit", "log-attack"),
+            ("[2026-04-30 16:20:42.301] GAME-ATTACK: ckey hit", "log-attack"),
+            ("[2026-04-30 16:20:42.301] SAY: ckey says", "log-say"),
+            ("[2026-04-30 16:20:42.301] WHISPER: ckey whispers", "log-say"),
+            ("[2026-04-30 16:20:42.301] EMOTE: ckey emotes", "log-emote"),
+            ("[2026-04-30 16:20:42.301] DSAY: ghost talks", "log-dead"),
+            ("[2026-04-30 16:20:42.301] OOC: out of character", "log-ooc"),
+            ("[2026-04-30 16:20:42.301] ADMIN: ckey adminned", "log-admin"),
+            ("[2026-04-30 16:20:42.301] ASAY: admin chat", "log-admin"),
+            ("[2026-04-30 16:20:42.301] ADMINPRIVATE: hidden", "log-adminprivate"),
+            ("[2026-04-30 16:20:42.301] ACCESS: Login: ckey", "log-access"),
+            ("[2026-04-30 16:20:42.301] PRAY: dear god", "log-event"),
+            ("[2026-04-30 16:20:42.301] VOTE: ckey votes", "log-event"),
+            ("[2026-04-30 16:20:42.301] GAME: round started", "log-event"),
+            ("[2026-04-30 16:20:42.301] PDA: ping", "log-chat"),
+            ("[2026-04-30 16:20:42.301] TELECOMMS: chatter", "log-chat"),
+            ("[2026-04-30 16:20:42.301] MECHA: hello", "log-mechanism"),
+            ("[2026-04-30 16:20:42.301] SHUTTLE: dock", "log-mechanism"),
+            ("[2026-04-30 16:20:42.301] ECON: 100cr", "log-econ"),
+            ("[2026-04-30 16:20:42.301] TOPIC: probe", "log-system"),
+            ("[2026-04-30 16:20:42.301] SQL: query", "log-system"),
+            ("-censored(empty_line)-", "log-censored"),
+            ("-censored(access detail)-", "log-censored"),
+            ("Not a log-shaped line at all", "log-default"),
+            ("[2026-04-30 16:20:42.301] UNKNOWN_TAG: stuff", "log-default"),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(line_class(line), *expected, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn colorize_line_wraps_categorized_lines_only() {
+        // Default lines pass through with no span wrapper to save bytes.
+        let plain = colorize_line("Not a log line");
+        assert_eq!(plain, "Not a log line");
+
+        let attack = colorize_line("[2026-04-30 16:20:42.301] ATTACK: ckey hit target");
+        assert!(attack.starts_with("<span class=\"log-attack\">"));
+        assert!(attack.ends_with("</span>"));
+        // Body is HTML-escaped inside the span.
+        assert!(attack.contains("ATTACK:"));
+    }
+
+    #[test]
+    fn viewer_page_colorizes_attack_line() {
+        let path = std::path::Path::new("round-1/game.log");
+        let content = "[2026-04-30 16:20:42.301] ATTACK: ckey hit target";
+        let html = viewer_page(path, content);
+        assert!(html.contains("<span class=\"log-attack\">"));
+        assert!(html.contains(".log-attack"));
     }
 }
