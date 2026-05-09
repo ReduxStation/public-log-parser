@@ -2,7 +2,7 @@ use std::{collections::HashMap, io::ErrorKind, path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{OriginalUri, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::Serialize;
@@ -21,11 +21,12 @@ struct TraversalItem {
     is_dir: bool,
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(request_headers))]
 pub async fn get(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
 ) -> Result<impl IntoResponse, axum::response::Response> {
     let decoded_path = percent_encoding::percent_decode_str(uri.path()).decode_utf8_lossy();
     tracing::debug!("path after percent decoding: {}", decoded_path);
@@ -140,24 +141,46 @@ pub async fn get(
             return Ok(NOT_FOUND.into_response());
         };
 
-        Ok((
-            StatusCode::OK,
-            headers(
-                if requested_path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
-                    "application/json"
-                } else {
-                    "text/plain"
-                },
-            ),
-            strategy(std::fs::read_to_string(&requested_path).map_err(|error| {
-                error_to_response(
-                    error,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "couldn't read file",
-                )
-            })?),
-        )
-            .into_response())
+        let extension = requested_path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str);
+
+        let scrubbed = strategy(std::fs::read_to_string(&requested_path).map_err(|error| {
+            error_to_response(
+                error,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "couldn't read file",
+            )
+        })?);
+
+        // Decide whether to wrap the file in the styled log viewer page.
+        // Wrap only when:
+        //   * the client did NOT pass ?raw=1
+        //   * the client's Accept header includes text/html (i.e. a browser)
+        //   * the file is plain text (.log, .txt, no extension), not JSON or
+        //     a pre-rendered HTML round report.
+        let force_raw = params.get("raw").map(|v| v == "1").unwrap_or(false);
+        let prefers_html = !force_raw && accept_prefers_html(&request_headers);
+        let plain_text_extension = matches!(extension, Some("log") | Some("txt") | None);
+
+        if prefers_html && plain_text_extension {
+            let relative = requested_path
+                .strip_prefix(&state.config.raw_logs_path)
+                .unwrap_or(&requested_path);
+            return Ok((
+                StatusCode::OK,
+                headers("text/html; charset=utf-8"),
+                viewer_page(relative, &scrubbed),
+            )
+                .into_response());
+        }
+
+        let content_type = match extension {
+            Some("json") => "application/json",
+            Some("html") => "text/html",
+            _ => "text/plain; charset=utf-8",
+        };
+        Ok((StatusCode::OK, headers(content_type), scrubbed).into_response())
     } else {
         Ok((StatusCode::BAD_REQUEST, "tried to access weird file").into_response())
     }
@@ -290,6 +313,97 @@ async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Resul
     ))
 }
 
+fn accept_prefers_html(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|h| h.to_str().ok())
+        .map(|a| a.contains("text/html"))
+        .unwrap_or(false)
+}
+
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn viewer_page(relative_path: &std::path::Path, scrubbed_content: &str) -> String {
+    let title = relative_path.display().to_string();
+    let breadcrumbs = link_segments(relative_path);
+    let body = html_escape(scrubbed_content);
+
+    format!(
+        "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<title>{title}</title>
+<meta name=\"color-scheme\" content=\"light dark\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: light-dark(#f3f6f7, #1c1d1f);
+    color: light-dark(#222, #ddd);
+    min-height: 100vh;
+}}
+header {{
+    padding: 1rem 1.5rem;
+    background: light-dark(#fff, #2a2c2f);
+    border-bottom: 1px solid light-dark(#e0e4e7, #3a3c3f);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}}
+.path {{ font-size: 1.05rem; }}
+.path a {{ color: inherit; text-decoration: none; }}
+.path a:hover {{ text-decoration: underline; }}
+.actions {{ font-size: 0.9rem; }}
+.actions a {{
+    color: light-dark(#0066cc, #66aaff);
+    text-decoration: none;
+    padding: 0.35rem 0.7rem;
+    border-radius: 4px;
+    background: light-dark(#eef3f9, #353739);
+}}
+.actions a:hover {{ background: light-dark(#dbe7f3, #424446); }}
+pre {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.85rem;
+    padding: 1.5rem;
+    line-height: 1.45;
+    white-space: pre;
+    overflow-x: auto;
+    background: light-dark(#fff, #1c1d1f);
+}}
+</style>
+</head>
+<body>
+<header>
+<div class=\"path\">{breadcrumbs}</div>
+<div class=\"actions\"><a href=\"?raw=1\">view raw</a></div>
+</header>
+<pre>{body}</pre>
+</body>
+</html>"
+    )
+}
+
 fn link_segments(path: &std::path::Path) -> String {
     let mut pieces = Vec::new();
 
@@ -304,4 +418,65 @@ fn link_segments(path: &std::path::Path) -> String {
     }
 
     pieces.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accept_header(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("accept", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn accept_prefers_html_browser_default() {
+        // Firefox/Chrome default Accept header
+        let h = accept_header(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        );
+        assert!(accept_prefers_html(&h));
+    }
+
+    #[test]
+    fn accept_prefers_html_curl_default() {
+        // curl sends Accept: */*
+        let h = accept_header("*/*");
+        assert!(!accept_prefers_html(&h));
+    }
+
+    #[test]
+    fn accept_prefers_html_no_header() {
+        let h = HeaderMap::new();
+        assert!(!accept_prefers_html(&h));
+    }
+
+    #[test]
+    fn accept_prefers_html_explicit_text_plain() {
+        let h = accept_header("text/plain");
+        assert!(!accept_prefers_html(&h));
+    }
+
+    #[test]
+    fn html_escape_handles_special_chars() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x")</script>"#),
+            "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"
+        );
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("it's"), "it&#39;s");
+    }
+
+    #[test]
+    fn viewer_page_contains_path_and_escaped_body() {
+        let path = std::path::Path::new("2026/04/30/round-2/game.log");
+        let content = "[ts] GAME: <not really a tag>";
+        let html = viewer_page(path, content);
+        assert!(html.contains("<title>2026/04/30/round-2/game.log</title>"));
+        assert!(html.contains("&lt;not really a tag&gt;"));
+        assert!(html.contains("?raw=1"));
+        // breadcrumb segment for round-2
+        assert!(html.contains(">round-2</a>"));
+    }
 }
