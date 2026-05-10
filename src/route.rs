@@ -272,24 +272,175 @@ fn error_to_response(
         .into_response()
 }
 
+/// Shared "ntOS95" / Windows-95-PDA chrome used by both the traversal
+/// listing and the file viewer page. Mirrors the design tokens from
+/// the upstream tgstation tgui-core ntOS95 theme:
+///   * teal desktop background (`#008080`)
+///   * medium-gray window chrome (`#bfbfbf`) with 3D outset bevel
+///   * navy title bar (`#000080`) with white "MS Sans Serif" text
+///   * sunken white content area for actual data
+///   * sharp corners and zero transitions
+///
+/// Source reference: https://github.com/tgstation/tgui-core/blob/main/styles/themes/ntOS95.scss
+const RETRO_CSS: &str = "
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: \"MS Sans Serif\", \"Microsoft Sans Serif\", Tahoma, sans-serif;
+    font-size: 11px;
+    background: #008080;
+    color: #000;
+    min-height: 100vh;
+    padding: 1.5rem;
+}
+.window {
+    max-width: 960px;
+    margin: 0 auto;
+    background: #bfbfbf;
+    border-top: 2px solid #ffffff;
+    border-left: 2px solid #ffffff;
+    border-right: 2px solid #404040;
+    border-bottom: 2px solid #404040;
+    box-shadow: 1px 1px 0 0 #000;
+    padding: 2px;
+}
+.title-bar {
+    background: #000080;
+    color: #fff;
+    padding: 3px 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: bold;
+    user-select: none;
+}
+.title-bar .path { display: flex; align-items: center; gap: 4px; overflow: hidden; }
+.title-bar .path a { color: #fff; text-decoration: none; }
+.title-bar .path a:hover { text-decoration: underline; }
+.title-bar .controls { display: flex; gap: 2px; flex-shrink: 0; }
+.title-bar .controls .btn {
+    width: 18px; height: 16px;
+    background: #bfbfbf;
+    color: #000;
+    border-top: 1px solid #ffffff;
+    border-left: 1px solid #ffffff;
+    border-right: 1px solid #404040;
+    border-bottom: 1px solid #404040;
+    font-family: \"Marlett\", monospace;
+    font-size: 9px;
+    line-height: 14px;
+    text-align: center;
+    cursor: default;
+}
+.menu-bar {
+    background: #bfbfbf;
+    padding: 2px 4px;
+    border-bottom: 1px solid #808080;
+    font-size: 11px;
+    color: #000;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+}
+.menu-bar .summary { color: #000; }
+.content {
+    background: #ffffff;
+    color: #000;
+    border-top: 1px solid #404040;
+    border-left: 1px solid #404040;
+    border-right: 1px solid #ffffff;
+    border-bottom: 1px solid #ffffff;
+    margin: 4px;
+    padding: 4px;
+    font-family: \"Lucida Console\", \"Courier New\", Courier, monospace;
+    font-size: 12px;
+    line-height: 1.4;
+}
+.empty {
+    padding: 2rem;
+    text-align: center;
+    color: #808080;
+}
+ul.listing {
+    list-style: none;
+}
+.item a {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    color: #000080;
+    text-decoration: none;
+    font-family: \"MS Sans Serif\", Tahoma, sans-serif;
+    font-size: 11px;
+}
+.item a:hover { background: #000080; color: #ffffff; }
+.item .icon {
+    display: inline-block;
+    width: 16px;
+    text-align: center;
+    flex-shrink: 0;
+}
+.item.dir  .icon::before { content: \"\\1F4C1\"; }  /* folder emoji */
+.item.file .icon::before { content: \"\\1F4C4\"; }  /* page emoji */
+.status-bar {
+    background: #bfbfbf;
+    padding: 3px 6px;
+    border-top: 1px solid #ffffff;
+    font-size: 11px;
+    color: #000;
+    border-top: 1px solid #ffffff;
+    margin-top: 2px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+pre {
+    font-family: \"Lucida Console\", \"Courier New\", Courier, monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: pre;
+    overflow-x: auto;
+    background: #ffffff;
+    color: #000;
+    padding: 4px 6px;
+    margin: 0;
+}
+/* Per-line colour coding by log category. Tuned for readability
+   against the white console background, mostly retaining the original
+   palette's intent but with darker shades that contrast properly. */
+.log-attack        { color: #c0392b; }
+.log-say           { color: #1b5e57; }
+.log-emote         { color: #1b5e57; font-style: italic; }
+.log-dead          { color: #6a1b9a; font-style: italic; }
+.log-ooc           { color: #1565c0; }
+.log-admin         { color: #1565c0; font-weight: 600; }
+.log-adminprivate  { color: #607d8b; font-style: italic; }
+.log-access        { color: #455a64; }
+.log-event         { color: #b9770e; }
+.log-chat          { color: #00695c; }
+.log-mechanism     { color: #6d4c41; }
+.log-econ          { color: #2e6b35; }
+.log-system        { color: #555; }
+.log-censored      { color: #aaaaaa; font-style: italic; }
+";
+
 async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Result<String> {
     let items = collect_traversal_items(state, path).await?;
 
     let list_html: String = items
         .iter()
         .map(|item| {
-            // Each item gets a class based on whether it's a directory or
-            // file so the stylesheet can hint at the type with an emoji
-            // marker without us having to ship icons.
+            // Each item carries dir/file class so the stylesheet picks
+            // the right Win95 icon glyph for it.
             if item.is_dir {
                 format!(
-                    "<li class=\"item dir\"><a href='{path}'>{name}/</a></li>",
+                    "<li class=\"item dir\"><a href='{path}'><span class=\"icon\"></span>{name}/</a></li>",
                     path = item.path,
                     name = html_escape(&item.name),
                 )
             } else {
                 format!(
-                    "<li class=\"item file\"><a href='{path}'>{name}</a></li>",
+                    "<li class=\"item file\"><a href='{path}'><span class=\"icon\"></span>{name}</a></li>",
                     path = item.path,
                     name = html_escape(&item.name),
                 )
@@ -299,10 +450,15 @@ async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Resul
 
     let relative_to_top = path.strip_prefix(&state.config.raw_logs_path)?;
     let title = relative_to_top.display().to_string();
-    let display_title = if title.is_empty() { String::from("logs") } else { title.clone() };
+    let display_title = if title.is_empty() { String::from("Logs") } else { title.clone() };
     let breadcrumbs = link_segments(relative_to_top);
     let item_count = items.len();
-    let item_word = if item_count == 1 { "entry" } else { "entries" };
+    let item_word = if item_count == 1 { "object" } else { "objects" };
+    let body = if items.is_empty() {
+        String::from("<div class=\"empty\">No log files in this directory.</div>")
+    } else {
+        format!("<ul class=\"listing\">{list_html}</ul>")
+    };
 
     Ok(format!(
         "<!DOCTYPE html>
@@ -310,96 +466,24 @@ async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Resul
 <head>
 <meta charset=\"utf-8\">
 <title>{display_title}</title>
-<meta name=\"color-scheme\" content=\"light dark\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
-    background: light-dark(#f3f6f7, #1c1d1f);
-    color: light-dark(#222, #ddd);
-    min-height: 100vh;
-}}
-header {{
-    padding: 1rem 1.5rem;
-    background: light-dark(#fff, #2a2c2f);
-    border-bottom: 1px solid light-dark(#e0e4e7, #3a3c3f);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 1rem;
-    flex-wrap: wrap;
-    position: sticky;
-    top: 0;
-    z-index: 10;
-}}
-.path {{ font-size: 1.05rem; }}
-.path a {{ color: inherit; text-decoration: none; }}
-.path a:hover {{ text-decoration: underline; }}
-.summary {{
-    font-size: 0.85rem;
-    color: light-dark(#666, #999);
-}}
-main {{
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 1.5rem;
-}}
-.empty {{
-    padding: 2rem;
-    text-align: center;
-    color: light-dark(#666, #999);
-    background: light-dark(#fff, #1c1d1f);
-    border: 1px solid light-dark(#e0e4e7, #3a3c3f);
-    border-radius: 6px;
-}}
-ul {{
-    list-style: none;
-    background: light-dark(#fff, #1c1d1f);
-    border: 1px solid light-dark(#e0e4e7, #3a3c3f);
-    border-radius: 6px;
-    overflow: hidden;
-}}
-.item + .item {{
-    border-top: 1px solid light-dark(#eef0f2, #2f3134);
-}}
-.item a {{
-    display: block;
-    padding: 0.6rem 1rem 0.6rem 2.4rem;
-    color: light-dark(#0066cc, #66aaff);
-    text-decoration: none;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.92rem;
-    position: relative;
-}}
-.item a:hover {{ background: light-dark(#eef3f9, #2a2c2f); }}
-.item a::before {{
-    position: absolute;
-    left: 0.9rem;
-    top: 50%;
-    transform: translateY(-50%);
-    font-size: 0.95rem;
-    line-height: 1;
-}}
-.item.dir a::before  {{ content: \"\\1F4C1\"; }}  /* folder */
-.item.file a::before {{ content: \"\\1F4C4\"; }}  /* page-with-text */
-</style>
+<style>{RETRO_CSS}</style>
 </head>
 <body>
-<header>
-<div class=\"path\">{breadcrumbs}</div>
-<div class=\"summary\">{item_count} {item_word}</div>
-</header>
-<main>
-{body}
-</main>
+<div class=\"window\">
+  <div class=\"title-bar\">
+    <div class=\"path\">{breadcrumbs}</div>
+    <div class=\"controls\"><div class=\"btn\">_</div><div class=\"btn\">\u{25A1}</div><div class=\"btn\">x</div></div>
+  </div>
+  <div class=\"menu-bar\">
+    <div>File &nbsp; Edit &nbsp; View &nbsp; Help</div>
+    <div class=\"summary\">{item_count} {item_word}</div>
+  </div>
+  <div class=\"content\">{body}</div>
+  <div class=\"status-bar\"><div>Ready</div><div>{item_count} {item_word}</div></div>
+</div>
 </body>
-</html>",
-        body = if items.is_empty() {
-            String::from("<div class=\"empty\">No log files in this directory yet.</div>")
-        } else {
-            format!("<ul>{list_html}</ul>")
-        },
+</html>"
     ))
 }
 
@@ -488,6 +572,8 @@ fn viewer_page(relative_path: &std::path::Path, scrubbed_content: &str) -> Strin
         .map(colorize_line)
         .collect::<Vec<_>>()
         .join("\n");
+    let line_count = scrubbed_content.lines().count();
+    let line_word = if line_count == 1 { "line" } else { "lines" };
 
     format!(
         "<!DOCTYPE html>
@@ -495,74 +581,25 @@ fn viewer_page(relative_path: &std::path::Path, scrubbed_content: &str) -> Strin
 <head>
 <meta charset=\"utf-8\">
 <title>{title}</title>
-<meta name=\"color-scheme\" content=\"light dark\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
-    background: light-dark(#f3f6f7, #1c1d1f);
-    color: light-dark(#222, #ddd);
-    min-height: 100vh;
-}}
-header {{
-    padding: 1rem 1.5rem;
-    background: light-dark(#fff, #2a2c2f);
-    border-bottom: 1px solid light-dark(#e0e4e7, #3a3c3f);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 1rem;
-    flex-wrap: wrap;
-    position: sticky;
-    top: 0;
-    z-index: 10;
-}}
-.path {{ font-size: 1.05rem; }}
-.path a {{ color: inherit; text-decoration: none; }}
-.path a:hover {{ text-decoration: underline; }}
-.actions {{ font-size: 0.9rem; }}
-.actions a {{
-    color: light-dark(#0066cc, #66aaff);
-    text-decoration: none;
-    padding: 0.35rem 0.7rem;
-    border-radius: 4px;
-    background: light-dark(#eef3f9, #353739);
-}}
-.actions a:hover {{ background: light-dark(#dbe7f3, #424446); }}
-pre {{
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.85rem;
-    padding: 1.5rem;
-    line-height: 1.45;
-    white-space: pre;
-    overflow-x: auto;
-    background: light-dark(#fff, #1c1d1f);
-}}
-/* Per-line colour coding by log category. Tuned so each class is */
-/* readable against both the light and dark page background.      */
-.log-attack        {{ color: light-dark(#c0392b, #ff6b5a); }}
-.log-say           {{ color: light-dark(#27867d, #5fc6b8); }}
-.log-emote         {{ color: light-dark(#27867d, #5fc6b8); font-style: italic; }}
-.log-dead          {{ color: light-dark(#7d3c98, #c39ce6); font-style: italic; }}
-.log-ooc           {{ color: light-dark(#2874a6, #67aee6); }}
-.log-admin         {{ color: light-dark(#1e72c0, #6cb1ff); font-weight: 600; }}
-.log-adminprivate  {{ color: light-dark(#888, #777); font-style: italic; }}
-.log-access        {{ color: light-dark(#7f8c8d, #98a4a5); }}
-.log-event         {{ color: light-dark(#b9770e, #ffb84a); }}
-.log-chat          {{ color: light-dark(#16a085, #5dd6be); }}
-.log-mechanism     {{ color: light-dark(#7e5109, #d4a44a); }}
-.log-econ          {{ color: light-dark(#2e6b35, #6eba79); }}
-.log-system        {{ color: light-dark(#888, #888); }}
-.log-censored      {{ color: light-dark(#aaa, #666); font-style: italic; }}
+<style>{RETRO_CSS}
+.menu-bar a {{ color: #000080; text-decoration: none; padding: 0 4px; }}
+.menu-bar a:hover {{ background: #000080; color: #fff; }}
 </style>
 </head>
 <body>
-<header>
-<div class=\"path\">{breadcrumbs}</div>
-<div class=\"actions\"><a href=\"?raw=1\">view raw</a></div>
-</header>
-<pre>{body}</pre>
+<div class=\"window\">
+  <div class=\"title-bar\">
+    <div class=\"path\">{breadcrumbs}</div>
+    <div class=\"controls\"><div class=\"btn\">_</div><div class=\"btn\">\u{25A1}</div><div class=\"btn\">x</div></div>
+  </div>
+  <div class=\"menu-bar\">
+    <div>File &nbsp; Edit &nbsp; View &nbsp; <a href=\"?raw=1\">Raw</a></div>
+    <div class=\"summary\">{line_count} {line_word}</div>
+  </div>
+  <div class=\"content\"><pre>{body}</pre></div>
+  <div class=\"status-bar\"><div>Ready</div><div>{line_count} {line_word}</div></div>
+</div>
 </body>
 </html>"
     )
