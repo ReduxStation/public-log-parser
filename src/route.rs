@@ -278,38 +278,128 @@ async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Resul
     let list_html: String = items
         .iter()
         .map(|item| {
+            // Each item gets a class based on whether it's a directory or
+            // file so the stylesheet can hint at the type with an emoji
+            // marker without us having to ship icons.
             if item.is_dir {
                 format!(
-                    "<li><a href='{path}'>{name}/</a></li>",
+                    "<li class=\"item dir\"><a href='{path}'>{name}/</a></li>",
                     path = item.path,
-                    name = item.name
+                    name = html_escape(&item.name),
                 )
             } else {
                 format!(
-                    "<li><a href='{path}'>{name}</a></li>",
+                    "<li class=\"item file\"><a href='{path}'>{name}</a></li>",
                     path = item.path,
-                    name = item.name
+                    name = html_escape(&item.name),
                 )
             }
         })
         .collect();
 
     let relative_to_top = path.strip_prefix(&state.config.raw_logs_path)?;
+    let title = relative_to_top.display().to_string();
+    let display_title = if title.is_empty() { String::from("logs") } else { title.clone() };
+    let breadcrumbs = link_segments(relative_to_top);
+    let item_count = items.len();
+    let item_word = if item_count == 1 { "entry" } else { "entries" };
 
     Ok(format!(
-        "<html>
-            <head>
-                <title>{}</title>
-            </head>
-            <body>
-                <p>{}</p>
-                <hr />
-                <ul>{}</ul>
-            </body>
-        </html>",
-        relative_to_top.display(),
-        link_segments(relative_to_top),
-        list_html
+        "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<title>{display_title}</title>
+<meta name=\"color-scheme\" content=\"light dark\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: light-dark(#f3f6f7, #1c1d1f);
+    color: light-dark(#222, #ddd);
+    min-height: 100vh;
+}}
+header {{
+    padding: 1rem 1.5rem;
+    background: light-dark(#fff, #2a2c2f);
+    border-bottom: 1px solid light-dark(#e0e4e7, #3a3c3f);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}}
+.path {{ font-size: 1.05rem; }}
+.path a {{ color: inherit; text-decoration: none; }}
+.path a:hover {{ text-decoration: underline; }}
+.summary {{
+    font-size: 0.85rem;
+    color: light-dark(#666, #999);
+}}
+main {{
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 1.5rem;
+}}
+.empty {{
+    padding: 2rem;
+    text-align: center;
+    color: light-dark(#666, #999);
+    background: light-dark(#fff, #1c1d1f);
+    border: 1px solid light-dark(#e0e4e7, #3a3c3f);
+    border-radius: 6px;
+}}
+ul {{
+    list-style: none;
+    background: light-dark(#fff, #1c1d1f);
+    border: 1px solid light-dark(#e0e4e7, #3a3c3f);
+    border-radius: 6px;
+    overflow: hidden;
+}}
+.item + .item {{
+    border-top: 1px solid light-dark(#eef0f2, #2f3134);
+}}
+.item a {{
+    display: block;
+    padding: 0.6rem 1rem 0.6rem 2.4rem;
+    color: light-dark(#0066cc, #66aaff);
+    text-decoration: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.92rem;
+    position: relative;
+}}
+.item a:hover {{ background: light-dark(#eef3f9, #2a2c2f); }}
+.item a::before {{
+    position: absolute;
+    left: 0.9rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.95rem;
+    line-height: 1;
+}}
+.item.dir a::before  {{ content: \"\\1F4C1\"; }}  /* folder */
+.item.file a::before {{ content: \"\\1F4C4\"; }}  /* page-with-text */
+</style>
+</head>
+<body>
+<header>
+<div class=\"path\">{breadcrumbs}</div>
+<div class=\"summary\">{item_count} {item_word}</div>
+</header>
+<main>
+{body}
+</main>
+</body>
+</html>",
+        body = if items.is_empty() {
+            String::from("<div class=\"empty\">No log files in this directory yet.</div>")
+        } else {
+            format!("<ul>{list_html}</ul>")
+        },
     ))
 }
 
