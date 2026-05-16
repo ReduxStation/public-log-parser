@@ -1,23 +1,21 @@
-use std::{borrow::Cow, collections::HashMap, iter::Peekable, sync::LazyLock};
+use std::{collections::HashMap, iter::Peekable, sync::LazyLock};
 
 use regex::Regex;
 
 use crate::parsers::ip_filtering::filter_ips;
 
+// Drop BYOND-printed string-output runtime lines entirely.
+// Pattern matches lines like `runtime error: Cannot read "..."` which leak
+// arbitrary string values from the failing call site.
 pub fn process_runtimes_log(contents: String) -> String {
-    contents
-        .lines()
-        .map(|line| sanitize_runtimes_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// Remove BYOND printed strings
-fn sanitize_runtimes_line<'a>(line: &'a str) -> Cow<'a, str> {
     static STRING_OUTPUT_REGEX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"^.*Cannot read ".*$"#).unwrap());
 
-    STRING_OUTPUT_REGEX.replace(line, "-censored (string output)")
+    contents
+        .lines()
+        .filter(|line| !STRING_OUTPUT_REGEX.is_match(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, serde::Serialize)]

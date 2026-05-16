@@ -421,7 +421,6 @@ pre {
 .log-mechanism     { color: #6d4c41; }
 .log-econ          { color: #2e6b35; }
 .log-system        { color: #555; }
-.log-censored      { color: #aaaaaa; font-style: italic; }
 ";
 
 async fn traversal_page(state: &AppState, path: &std::path::Path) -> eyre::Result<String> {
@@ -513,12 +512,9 @@ fn html_escape(input: &str) -> String {
 /// Pick a CSS class name based on the log category in this line.
 /// Lines look like `[2026-04-30 16:20:42.301] CATEGORY: rest of line`.
 /// Categories may be prefixed with `GAME-`. Lines that don't match the
-/// shape (e.g. `Starting up round ID 2.`, parser-generated `-censored(...)-`,
-/// continuation lines) get a default or censored class.
+/// shape (e.g. `Starting up round ID 2.`, continuation lines) get the
+/// default class.
 fn line_class(line: &str) -> &'static str {
-    if line.starts_with("-censored(") {
-        return "log-censored";
-    }
     let Some(rest) = line.strip_prefix('[') else {
         return "log-default";
     };
@@ -705,8 +701,6 @@ mod tests {
             ("[2026-04-30 16:20:42.301] ECON: 100cr", "log-econ"),
             ("[2026-04-30 16:20:42.301] TOPIC: probe", "log-system"),
             ("[2026-04-30 16:20:42.301] SQL: query", "log-system"),
-            ("-censored(empty_line)-", "log-censored"),
-            ("-censored(access detail)-", "log-censored"),
             ("Not a log-shaped line at all", "log-default"),
             ("[2026-04-30 16:20:42.301] UNKNOWN_TAG: stuff", "log-default"),
         ];

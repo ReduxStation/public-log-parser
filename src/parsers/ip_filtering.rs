@@ -7,5 +7,5 @@ static IP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn filter_ips<'a>(contents: &'a str) -> Cow<'a, str> {
-    IP_REGEX.replace_all(contents, "-censored-")
+    IP_REGEX.replace_all(contents, "")
 }

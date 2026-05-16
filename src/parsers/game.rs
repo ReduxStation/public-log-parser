@@ -4,27 +4,20 @@ use regex::{Regex, RegexSet};
 
 use super::ip_filtering::filter_ips;
 
-// A macro to allow for &'static str returns
-macro_rules! censor {
-    ($kind:literal) => {
-        concat!("-censored(", $kind, ")-")
-    };
-}
-
 #[tracing::instrument(skip_all)]
-pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
+pub fn parse_line<'a>(line: &'a str) -> Option<Cow<'a, str>> {
     let line = line.trim();
 
     if line.is_empty() {
-        return censor!("empty_line").into();
+        return None;
     }
 
     if !line.starts_with('[') {
-        return censor!("no_ts_start").into();
+        return None;
     }
 
     let Some((timestamp, contents)) = line.split_once(']') else {
-        return censor!("no_category_colon").into(); // Matching PHP
+        return None;
     };
 
     static TIMESTAMP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -33,28 +26,28 @@ pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
         ).unwrap()
     });
     if !TIMESTAMP_REGEX.is_match(&timestamp[1..]) {
-        return censor!("no_ts_regex_match").into();
+        return None;
     }
 
     if contents.starts_with(" Starting up round ID ") {
-        return Cow::Borrowed(line);
+        return Some(Cow::Borrowed(line));
     }
 
     let mut words = contents.split(' ');
     if words.next() != Some("") {
-        return censor!("no_space_after_timestamp").into();
+        return None;
     }
 
     let log_type = {
         let next_word = words.next().expect("out of words");
         if !next_word.ends_with(':') {
-            return censor!("no_category_colon").into();
+            return None;
         }
 
         if next_word == "GAME-COMPAT:" {
             match words.next() {
                 Some(next_word) => next_word,
-                None => return censor!("game_compat_no_followup").into(),
+                None => return None,
             }
         } else {
             next_word
@@ -67,30 +60,35 @@ pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
                 let mut words_vec = words.collect::<Vec<_>>();
 
                 if words_vec.len() < 4 {
-                    return censor!("malformed access login").into();
+                    return None;
                 }
 
+                // Drop the IP/CID token entirely. Format from client_procs.dm:
+                //   "Login: ckey from <ip>-<cid> || BYOND v<v>"
+                // After filter_ips empties the IP, the token at len-4 is "-<cid>";
+                // remove it so the rendered line becomes
+                //   "Login: ckey from || BYOND v<v>"
+                // No "-censored-" placeholder shown.
                 let ip_cid_index = words_vec.len() - 4;
-                words_vec[ip_cid_index] = censor!("ip/cid");
+                words_vec.remove(ip_cid_index);
 
-                Cow::Owned(format!(
+                Some(Cow::Owned(format!(
                     "{timestamp}] {log_type} Login: {}",
                     words_vec.join(" ")
-                ))
+                )))
             }
 
             // Logout lines carry only a ckey, safe to keep verbatim.
-            Some("Logout:") => Cow::Borrowed(line),
+            Some("Logout:") => Some(Cow::Borrowed(line)),
 
-            // Anything else under ACCESS gets censored. Variants like
+            // Anything else under ACCESS is dropped. Variants like
             //   "Failed Login: ckey CID IP - reason"
             //   "Forced disconnect: ckey CID IP - CID randomizer check"
             //   "Notice: ckey has the same IP (X) / ID (Y) as other_ckey"
             //   "AFK: ckey"
-            // either leak IP and CID in non-trivial positions or are noisy
-            // enough that default-censoring unknown subcategories is the
-            // safer choice for codebases that diverge from upstream tg.
-            _ => censor!("access detail").into(),
+            // leak IP and CID in positions we don't have a structured parser
+            // for, so they don't appear in public output at all.
+            _ => None,
         },
 
         "ADMIN" => {
@@ -113,26 +111,26 @@ pub fn parse_line<'a>(line: &'a str) -> Cow<'a, str> {
             });
 
             if REGEX_SET.is_match(&remaining) {
-                return censor!("asay/apm/ahelp/notes/etc").into();
+                return None;
             }
 
-            Cow::Borrowed(line)
+            Some(Cow::Borrowed(line))
         }
 
-        "ADMINPRIVATE" => censor!("private logtype").into(),
+        "ADMINPRIVATE" => None,
 
-        "TOPIC" => censor!("world_topic logs").into(),
+        "TOPIC" => None,
 
-        "SQL" => censor!("sql logs").into(),
+        "SQL" => None,
 
-        _ => Cow::Borrowed(line),
+        _ => Some(Cow::Borrowed(line)),
     }
 }
 
 pub fn process_game_log(contents: String) -> String {
     filter_ips(&contents)
         .lines()
-        .map(parse_line)
+        .filter_map(parse_line)
         .fold(String::new(), |a, b| a + &b + "\n")
 }
 
@@ -142,68 +140,108 @@ mod tests {
 
     // The IP regex runs at the file-level filter_ips() pass before parse_line()
     // sees any line, so for these per-line tests we feed already-IP-filtered
-    // input (the IP literal substituted with the global "-censored-" token).
+    // input (the IP literal substituted with the empty string).
 
     #[test]
     fn access_login_strips_ip_cid_token() {
         // Real format from client_procs.dm:229
         // [ts] ACCESS: Login: ckey from <ip>-<cid> || BYOND v<v>
-        let line = "[2026-04-30 16:20:42.301] ACCESS: Login: SomeUser from -censored--2548808841 || BYOND v516.1681";
-        let out = parse_line(line);
+        // After filter_ips empties the IP, what reaches parse_line is:
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Login: SomeUser from -2548808841 || BYOND v516.1681";
+        let out = parse_line(line).expect("Login lines are kept, with IP/CID dropped");
         assert!(!out.contains("2548808841"), "CID survived: {out}");
-        assert!(out.contains("ip/cid"), "expected ip/cid censor token: {out}");
+        assert!(!out.contains("censored"), "no censor placeholder should appear: {out}");
         assert!(out.contains("SomeUser"), "ckey should remain: {out}");
+        assert!(out.contains("BYOND v516.1681"), "BYOND version should remain: {out}");
     }
 
     #[test]
     fn access_logout_kept_verbatim() {
         let line = "[2026-04-30 16:20:42.301] ACCESS: Logout: SomeUser";
-        let out = parse_line(line);
+        let out = parse_line(line).expect("Logout lines are kept verbatim");
         assert_eq!(out, line);
     }
 
     #[test]
-    fn access_failed_login_censored() {
+    fn access_failed_login_dropped() {
         // [ts] ACCESS: Failed Login: key CID IP - reason
-        let line = "[2026-04-30 16:20:42.301] ACCESS: Failed Login: someone 1234567890 -censored- - blacklisted byond version";
-        let out = parse_line(line);
-        assert!(!out.contains("1234567890"), "CID survived in Failed Login: {out}");
-        assert!(out.contains("censored"), "expected censor token: {out}");
+        // Dropped entirely from output.
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Failed Login: someone 1234567890 - blacklisted byond version";
+        assert!(parse_line(line).is_none(), "Failed Login should be dropped");
     }
 
     #[test]
-    fn access_forced_disconnect_censored() {
+    fn access_forced_disconnect_dropped() {
         // [ts] ACCESS: Forced disconnect: ckey CID IP - CID randomizer check
-        let line = "[2026-04-30 16:20:42.301] ACCESS: Forced disconnect: foo 1234567890 -censored- - CID randomizer check";
-        let out = parse_line(line);
-        assert!(!out.contains("1234567890"), "CID survived in Forced disconnect: {out}");
-        assert!(out.contains("censored"), "expected censor token: {out}");
+        let line = "[2026-04-30 16:20:42.301] ACCESS: Forced disconnect: foo 1234567890 - CID randomizer check";
+        assert!(parse_line(line).is_none(), "Forced disconnect should be dropped");
     }
 
     #[test]
-    fn access_notice_same_ip_id_censored() {
+    fn access_notice_same_ip_id_dropped() {
         // [ts] ACCESS: Notice: ckey has the same IP (X) / ID (Y) as other_ckey
         let line = "[2026-04-30 16:20:42.301] ACCESS: Notice: foo has the same ID (1234567890) as bar";
-        let out = parse_line(line);
-        assert!(!out.contains("1234567890"), "CID survived in Notice: {out}");
-        assert!(out.contains("censored"), "expected censor token: {out}");
+        assert!(parse_line(line).is_none(), "Notice lines should be dropped");
     }
 
     #[test]
-    fn access_afk_censored() {
+    fn access_afk_dropped() {
         // server_maint.dm:66
         let line = "[2026-04-30 16:20:42.301] ACCESS: AFK: someuser";
-        let out = parse_line(line);
-        // AFK lines aren't strictly sensitive but default-censor for unknown
-        // ACCESS subcategories is the contract.
-        assert!(out.contains("censored"), "expected censor token: {out}");
+        assert!(parse_line(line).is_none(), "AFK lines should be dropped");
     }
 
     #[test]
-    fn adminprivate_censored() {
-        let line = "[2026-04-30 16:20:42.301] ADMINPRIVATE: ASAY: SomeAdmin/(real) ban deliberation";
-        let out = parse_line(line);
-        assert!(out.contains("private logtype"));
-        assert!(!out.contains("real"));
+    fn admin_private_dropped() {
+        let line = "[2026-04-30 16:20:42.301] ADMINPRIVATE: sensitive admin chatter";
+        assert!(parse_line(line).is_none(), "ADMINPRIVATE should be dropped");
+    }
+
+    #[test]
+    fn topic_dropped() {
+        let line = "[2026-04-30 16:20:42.301] TOPIC: world.Topic query?key=value";
+        assert!(parse_line(line).is_none(), "TOPIC lines should be dropped");
+    }
+
+    #[test]
+    fn sql_dropped() {
+        let line = "[2026-04-30 16:20:42.301] SQL: SELECT * FROM users WHERE id = 1";
+        assert!(parse_line(line).is_none(), "SQL lines should be dropped");
+    }
+
+    #[test]
+    fn empty_line_dropped() {
+        assert!(parse_line("").is_none(), "empty lines are dropped");
+        assert!(parse_line("   ").is_none(), "whitespace-only lines are dropped");
+    }
+
+    #[test]
+    fn malformed_dropped() {
+        assert!(parse_line("no leading bracket").is_none());
+        assert!(parse_line("[no closing bracket").is_none());
+        assert!(parse_line("[bad-timestamp] GAME: something").is_none());
+    }
+
+    #[test]
+    fn admin_pm_dropped() {
+        let line = "[2026-04-30 16:20:42.301] ADMIN: PM: from admin to player: contents";
+        assert!(parse_line(line).is_none(), "Admin PM should be dropped");
+    }
+
+    #[test]
+    fn process_game_log_drops_filtered_lines() {
+        let input = concat!(
+            "[2026-04-30 16:20:42.301] ACCESS: Login: alice from 1.2.3.4-100 || BYOND v516.1681\n",
+            "[2026-04-30 16:20:43.301] ADMINPRIVATE: secret\n",
+            "[2026-04-30 16:20:44.301] SQL: SELECT 1\n",
+            "[2026-04-30 16:20:45.301] ACCESS: Logout: alice\n",
+        );
+        let out = process_game_log(input.to_string());
+        assert!(out.contains("Login: alice"), "Login should be kept: {out}");
+        assert!(out.contains("Logout: alice"), "Logout should be kept: {out}");
+        assert!(!out.contains("ADMINPRIVATE"), "ADMINPRIVATE dropped: {out}");
+        assert!(!out.contains("SELECT"), "SQL dropped: {out}");
+        assert!(!out.contains("1.2.3.4"), "IP filtered: {out}");
+        assert!(!out.contains("censored"), "no censor placeholder: {out}");
     }
 }
