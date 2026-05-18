@@ -38,7 +38,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/resurgencestation/public-log-parser
+          images: ghcr.io/reduxstation/public-log-parser
           tags: |
             type=ref,event=branch
             type=sha,prefix=
